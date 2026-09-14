@@ -1,26 +1,30 @@
 # ===============================
-# Job Search Agent (UK) — LangGraph + Gemini + Gradio
+# Job Search Agent (UK) — LangChain create_agent + Gemini + Gradio
 # ===============================
 # Setup:
-#   pip install langchain langchain-google-genai langgraph gradio requests
+#   pip install -r requirements.txt
 #   Free Adzuna keys (UK jobs): https://developer.adzuna.com/  -> set ADZUNA_APP_ID / ADZUNA_APP_KEY
 #   Free Reed keys (UK jobs):   https://www.reed.co.uk/developers -> set REED_API_KEY
 #   At least one of these key pairs is required — the tools return an error message if unset.
+#
+# This version uses LangChain's prebuilt create_agent() instead of a hand-built LangGraph
+# StateGraph — it wires the same "LLM decides -> tool runs -> LLM reads result -> ..." loop
+# for you, and its checkpointer keeps full conversation state (including Gemini's tool-call
+# "thought signatures") automatically, so we no longer have to manage that by hand.
 
 import os
-import requests
-from typing import Literal
+import uuid
 
+import requests
+from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
-
-from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import InMemorySaver
 import gradio as gr
 
 
 # ===============================
-# Gemini 2.5 Flash LLM
+# Gemini LLM
 # ===============================
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.6-flash",
@@ -95,13 +99,8 @@ def _fmt(jobs, source):
     return "\n".join(lines)
 
 
-tools = [search_jobs_adzuna, search_jobs_reed, salary_to_monthly]
-tools_by_name = {t.name: t for t in tools}
-llm_with_tools = llm.bind_tools(tools)
-
-
 # ===============================
-# Nodes
+# Agent (built with create_agent)
 # ===============================
 SYSTEM_PROMPT = (
     "You are a UK job search assistant. Use the search tools to find real listings, "
@@ -109,51 +108,25 @@ SYSTEM_PROMPT = (
     "salary and link. Ask a clarifying question if the role or location is unclear."
 )
 
-
-def llm_call(state: MessagesState):
-    response = llm_with_tools.invoke([SystemMessage(content=SYSTEM_PROMPT)] + state["messages"])
-    return {"messages": [response]}
-
-
-def tool_node(state: MessagesState):
-    results = []
-    for tool_call in state["messages"][-1].tool_calls:
-        observation = tools_by_name[tool_call["name"]].invoke(tool_call["args"])
-        results.append(ToolMessage(content=str(observation), tool_call_id=tool_call["id"]))
-    return {"messages": results}
-
-
-def should_continue(state: MessagesState) -> Literal["tool_node", END]:
-    return "tool_node" if state["messages"][-1].tool_calls else END
-
-
-# ===============================
-# Build Agent Graph
-# ===============================
-builder = StateGraph(MessagesState)
-
-builder.add_node("llm_call", llm_call)
-builder.add_node("tool_node", tool_node)
-
-builder.add_edge(START, "llm_call")
-builder.add_conditional_edges("llm_call", should_continue, ["tool_node", END])
-builder.add_edge("tool_node", "llm_call")
-
-agent = builder.compile()
+# InMemorySaver = a checkpointer: it stores each conversation's full message state (keyed by
+# thread_id), so we don't need to hand-build or hand-mutate the message list ourselves — that
+# also means Gemini's tool-call thought signatures are preserved automatically across turns.
+agent = create_agent(
+    model=llm,
+    tools=[search_jobs_adzuna, search_jobs_reed, salary_to_monthly],
+    system_prompt=SYSTEM_PROMPT,
+    checkpointer=InMemorySaver(),
+)
 
 
 # ===============================
 # Gradio Chat UI
 # ===============================
-def chat(user_message, history, lc_messages):
-    # Keep the real LangChain messages (incl. tool calls + Gemini thought signatures) in gr.State.
-    # Rebuilding them from Gradio's plain-text history would drop the signatures and Gemini 3 rejects that.
-    # lc_messages is a mutable list stored in gr.State — mutate it in place (rather than reassign/return
-    # it) so the update persists even on Gradio versions whose ChatInterface has no additional_outputs.
-    lc_messages.append(HumanMessage(content=user_message))
-    result = agent.invoke({"messages": lc_messages})
-    lc_messages.clear()
-    lc_messages.extend(result["messages"])
+def chat(user_message, history, thread_id):
+    # One thread_id per browser session (created below) — the checkpointer uses it to look up
+    # that session's full message history, so we only ever need to send the newest message.
+    config = {"configurable": {"thread_id": thread_id}}
+    result = agent.invoke({"messages": [{"role": "user", "content": user_message}]}, config=config)
     return result["messages"][-1].content
 
 
@@ -161,7 +134,7 @@ demo = gr.ChatInterface(
     fn=chat,
     title="UK Job Search Agent",
     description="Ask e.g. 'Find senior .NET jobs in London paying over £70k' or 'remote C# roles in the UK'.",
-    additional_inputs=[gr.State([])],
+    additional_inputs=[gr.State(lambda: str(uuid.uuid4()))],  # fresh thread_id per session
 )
 
 if __name__ == "__main__":
